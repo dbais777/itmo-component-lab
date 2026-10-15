@@ -1,0 +1,103 @@
+name: Build and publish filesystem component
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+  packages: write
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Prepare component sources
+        shell: bash
+        run: |
+          mkdir -p src
+          cat > Dockerfile <<'COMPONENT_EOF'
+          FROM node:22-alpine
+          WORKDIR /app
+          COPY --chown=node:node index.mjs student.json ./
+          COPY --chown=node:node src ./src
+          USER node
+          CMD ["node", "index.mjs"]
+          COMPONENT_EOF
+          cat > index.mjs <<'COMPONENT_EOF'
+          import { readFile } from 'node:fs/promises';
+          import { analyzeDirectory } from './src/analyze.mjs';
+          
+          try {
+            const { isu } = JSON.parse(await readFile(new URL('./student.json', import.meta.url), 'utf8'));
+            if (typeof isu !== 'string' || !/^\d{6}$/.test(isu)) {
+              throw new Error('student.json must contain the six-digit student ISU');
+            }
+            const { files, directories, size } = await analyzeDirectory('/data');
+            process.stdout.write(`${isu}-${files}-${directories}-${size}\n`);
+          } catch (error) {
+            process.stderr.write(`${error.message}\n`);
+            process.exitCode = 1;
+          }
+          COMPONENT_EOF
+          cat > student.json <<'COMPONENT_EOF'
+          {"isu":"465107"}
+          COMPONENT_EOF
+          cat > src/analyze.mjs <<'COMPONENT_EOF'
+          import { lstat, readdir } from 'node:fs/promises';
+          import { join } from 'node:path';
+          
+          /**
+           * Recursively count regular files, nested directories, and file bytes.
+           * The root directory itself is deliberately excluded from the directory count.
+           */
+          export async function analyzeDirectory(root) {
+            let files = 0n;
+            let directories = 0n;
+            let size = 0n;
+          
+            const entries = await readdir(root, { withFileTypes: true });
+          
+            for (const entry of entries) {
+              const path = join(root, entry.name);
+          
+              if (entry.isSymbolicLink()) {
+                continue;
+              }
+          
+              if (entry.isDirectory()) {
+                directories += 1n;
+                const nested = await analyzeDirectory(path);
+                files += nested.files;
+                directories += nested.directories;
+                size += nested.size;
+                continue;
+              }
+          
+              if (entry.isFile()) {
+                const stats = await lstat(path, { bigint: true });
+                files += 1n;
+                size += stats.size;
+              }
+            }
+          
+            return { files, directories, size };
+          }
+          COMPONENT_EOF
+      - name: Build linux amd64 image
+        run: docker build --platform linux/amd64 -t ghcr.io/dbais777/itmo-component-lab:465107 .
+      - name: Verify component contract
+        shell: bash
+        run: |
+          mkdir -p test-data/docs/old test-data/empty
+          printf abc > 'test-data/a file.txt'
+          touch test-data/zero.txt
+          printf 1234567 > test-data/docs/old/data.bin
+          chmod -R a+rX test-data
+          result=$(docker run --rm --network none --read-only --mount type=bind,source="$PWD/test-data",target=/data,readonly ghcr.io/dbais777/itmo-component-lab:465107)
+          test "$result" = '465107-3-3-10'
+          printf '%s\n' "$result"
+      - name: Authenticate to GHCR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$GH_TOKEN" | docker login ghcr.io -u dbais777 --password-stdin
+      - name: Publish image
+        run: docker push ghcr.io/dbais777/itmo-component-lab:465107
